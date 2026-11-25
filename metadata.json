@@ -1,0 +1,6 @@
+{
+  "name": "红利量化 · 个股速查引擎",
+  "description": "A股双周期 EXPMA 与 7 维量化诊断引擎，支持高股息联动、盘口量价解析、公众号同款组合图表渲染及按需 AI 深度诊股。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
