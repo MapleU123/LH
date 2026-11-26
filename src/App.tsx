@@ -3,15 +3,30 @@ import { LogOut, Maximize2, QrCode, UserCheck } from 'lucide-react';
 import { AuthModal } from './components/AuthModal.tsx';
 import { StockQuickLookup } from './components/StockQuickLookup.tsx';
 import { StockTable, type DividendPoolItem } from './components/StockTable.tsx';
-import type { UserSession } from './shared/wechatTypes.ts';
+import type { GuestQuotaInfo, UserSession } from './shared/wechatTypes.ts';
+import {
+  fetchServerGuestQuota,
+  loadLocalGuestQuota,
+} from './utils/guestQuotaClient.ts';
 import { fetchCurrentSession, logoutSession } from './utils/wechatPairingService.ts';
 
+interface LookupTarget {
+  code: string;
+  isPreview: boolean;
+  nonce: number;
+}
+
 export default function App() {
-  const [embeddedCode, setEmbeddedCode] = useState('601088');
-  const [modalCode, setModalCode] = useState<string | null>(null);
+  const [embeddedTarget, setEmbeddedTarget] = useState<LookupTarget>({
+    code: '601088',
+    isPreview: true,
+    nonce: 0,
+  });
+  const [modalTarget, setModalTarget] = useState<LookupTarget | null>(null);
   const [dividendPool, setDividendPool] = useState<DividendPoolItem[]>([]);
 
   const [session, setSession] = useState<UserSession | null>(null);
+  const [guestQuota, setGuestQuota] = useState<GuestQuotaInfo>(() => loadLocalGuestQuota(false));
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authReason, setAuthReason] = useState<string | null>(null);
 
@@ -21,6 +36,10 @@ export default function App() {
     fetchCurrentSession()
       .then((s) => {
         if (s) setSession(s);
+        return fetchServerGuestQuota(Boolean(s?.isLoggedIn));
+      })
+      .then((q) => {
+        setGuestQuota(q);
       })
       .catch(() => {
         // Ignore auth check errors on boot
@@ -39,19 +58,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!modalCode) return;
+    if (!modalTarget) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setModalCode(null);
+        setModalTarget(null);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [modalCode]);
+  }, [modalTarget]);
 
   const handleLoadEmbedded = (code: string) => {
-    setEmbeddedCode(code);
+    setEmbeddedTarget({ code, isPreview: false, nonce: Date.now() });
     document.getElementById('lookup')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const handleOpenModalFromTable = (code: string) => {
+    setModalTarget({ code, isPreview: false, nonce: Date.now() });
   };
 
   const handleRequireAuth = useCallback((reason?: string) => {
@@ -62,6 +85,7 @@ export default function App() {
   const handleLoginSuccess = useCallback((nextSession: UserSession) => {
     setSession(nextSession);
     setAuthReason(null);
+    void fetchServerGuestQuota(true).then(setGuestQuota);
   }, []);
 
   const handleLogout = async () => {
@@ -69,6 +93,7 @@ export default function App() {
       await logoutSession(session?.token);
     } finally {
       setSession(null);
+      void fetchServerGuestQuota(false).then(setGuestQuota);
     }
   };
 
@@ -141,7 +166,13 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setModalCode(embeddedCode)}
+              onClick={() =>
+                setModalTarget({
+                  code: embeddedTarget.code,
+                  isPreview: embeddedTarget.code === '601088' && embeddedTarget.isPreview,
+                  nonce: Date.now(),
+                })
+              }
               className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-500 whitespace-nowrap shrink-0"
             >
               <Maximize2 className="h-3.5 w-3.5" />
@@ -156,8 +187,12 @@ export default function App() {
         <section id="lookup" className="scroll-mt-20">
           <StockQuickLookup
             mode="embedded"
-            initialQuery={embeddedCode}
+            initialQuery={embeddedTarget.code}
+            initialIsPreview={embeddedTarget.isPreview}
+            queryNonce={embeddedTarget.nonce}
             isLoggedIn={isLoggedIn}
+            guestQuota={guestQuota}
+            onGuestQuotaChange={setGuestQuota}
             onRequireAuth={handleRequireAuth}
           />
         </section>
@@ -167,9 +202,9 @@ export default function App() {
           items={dividendPool}
           isLoggedIn={isLoggedIn}
           onLoadEmbedded={handleLoadEmbedded}
-          onOpenModal={(code) => setModalCode(code)}
+          onOpenModal={handleOpenModalFromTable}
           onLoginSuccess={handleLoginSuccess}
-          onOpenAuthModal={() => handleRequireAuth('扫码并发送 6 位配对码即可解锁全量高股息标的与估值安全垫')}
+          onOpenAuthModal={() => handleRequireAuth('扫码并发送 6 位配对码即可解锁无限查股、全量高股息标的与估值安全垫')}
         />
 
         {/* Rules & WeChat Sync Explanation */}
@@ -186,7 +221,7 @@ export default function App() {
               </li>
               <li>
                 <span className="font-semibold text-slate-200">2. 量价与 KDJ 共振：</span>
-                实时拉取 250 日前复权日线计算 <span className="font-mono text-slate-300">KDJ(9,3,3)</span>，结合 5 日/20 日均量与实时量比判定温和放量（1.5~3.0）及显著放量异动（&gt;3.0）。
+                实时拉取 250 日前复权日线计算 <span className="font-mono text-slate-300">KDJ(9,3,3)</span>，结合 5 日/20 日均量与实时量比判定温和放量及显著放量异动（&gt;3.0）。
               </li>
               <li>
                 <span className="font-semibold text-slate-200">3. 实时调参联动：</span>
@@ -202,11 +237,11 @@ export default function App() {
             <ul className="mt-3 space-y-2 text-xs leading-relaxed text-slate-400">
               <li>
                 <span className="font-semibold text-slate-200">1. 6 位配对码免密解锁：</span>
-                通过 <span className="font-mono text-slate-300">website-to-wechat</span> 双向配对架构，关注公众号并发送 6 位数字配对码即可自动授权登录并解锁全量标的与高清导图权限。
+                未关注公众号访客永久累计仅限查询 3 个个股（不随日期重置）；关注公众号并发送 6 位配对码登录后立即解锁无限查询与高清导图权限。
               </li>
               <li>
                 <span className="font-semibold text-slate-200">2. 服务端同源看板 PNG：</span>
-                点击顶部「公众号自动回复图」即可预览并下载由服务端 <span className="font-mono text-slate-300">@resvg/resvg-js</span> 与内置中文字体直出渲染的 1120px 高清看板，与微信自动回复完全同源。
+                点击顶部「公众号自动回复图」即可预览并下载由服务端 <span className="font-mono text-slate-300">@resvg/resvg-js</span> 与内置中文字体直出渲染的 2 倍超清看板，与微信自动回复完全同源。
               </li>
               <li>
                 <span className="font-semibold text-slate-200">3. 独立按需 AI 深度诊股：</span>
@@ -225,22 +260,26 @@ export default function App() {
       </footer>
 
       {/* Modal Mount Mode */}
-      {modalCode && (
+      {modalTarget && (
         <div
           role="dialog"
           aria-modal="true"
           aria-label="个股速查弹窗"
           className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/75 p-3 sm:p-6 backdrop-blur-xs"
           onClick={(e) => {
-            if (e.target === e.currentTarget) setModalCode(null);
+            if (e.target === e.currentTarget) setModalTarget(null);
           }}
         >
           <div className="my-2 w-full max-w-[1200px] rounded-2xl border border-slate-800 bg-[#080B12] p-4 sm:p-6 shadow-2xl">
             <StockQuickLookup
               mode="modal"
-              initialQuery={modalCode}
-              onCloseModal={() => setModalCode(null)}
+              initialQuery={modalTarget.code}
+              initialIsPreview={modalTarget.isPreview}
+              queryNonce={modalTarget.nonce}
+              onCloseModal={() => setModalTarget(null)}
               isLoggedIn={isLoggedIn}
+              guestQuota={guestQuota}
+              onGuestQuotaChange={setGuestQuota}
               onRequireAuth={handleRequireAuth}
             />
           </div>
@@ -260,3 +299,4 @@ export default function App() {
     </div>
   );
 }
+

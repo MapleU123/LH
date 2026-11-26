@@ -501,7 +501,7 @@ export function WechatMpConfigModal({ open, onClose }: WechatMpConfigModalProps)
                     type="text"
                     value={wechatId}
                     onChange={(e) => setWechatId(e.target.value)}
-                    placeholder="gh_7d39de02f610"
+                    placeholder="gh_dec752a19703"
                     className="w-full rounded-lg border border-slate-700 bg-[#080B12] px-3 py-2 font-mono text-xs text-white focus:border-blue-500 focus:outline-none"
                   />
                 </label>

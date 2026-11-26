@@ -38,16 +38,16 @@ export function WechatPairingBox({
 
   const [serverMpInfo, setServerMpInfo] = useState<WechatMpPublicInfo>({
     name: '我爱这young',
-    wechatId: 'gh_7d39de02f610',
-    originalId: 'gh_7d39de02f610',
-    qrUrl: '/assets/aistudio/qrcode_gh_7d39de02f610_ff29ce68.jpg',
+    wechatId: 'gh_dec752a19703',
+    originalId: 'gh_dec752a19703',
+    qrUrl: '/assets/aistudio/image_77d5f18c.png',
   });
 
   const pairedCallbackFiredRef = useRef(false);
 
   const effectiveName = serverMpInfo.name;
   const effectiveWechatId = serverMpInfo.wechatId;
-  const effectiveQrUrl = serverMpInfo.qrUrl || '/assets/aistudio/qrcode_gh_7d39de02f610_ff29ce68.jpg';
+  const effectiveQrUrl = serverMpInfo.qrUrl || '/assets/aistudio/image_77d5f18c.png';
 
   const loadNewCode = useCallback(async () => {
     setLoadingCode(true);

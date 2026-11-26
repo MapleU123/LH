@@ -10,6 +10,7 @@ import {
   computeHighDividendInfo,
   DICTIONARY_BY_CODE,
   DIVIDEND_MAP,
+  HIGH_DIVIDEND_POOL,
   inferBoardAndExchange,
   isAShareStockCode,
   LOCAL_STOCK_DICTIONARY,
@@ -22,7 +23,190 @@ interface CacheEntry {
 }
 
 const diagnosisCache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 15_000;
+const CACHE_TTL_MS = 60_000;
+
+const COMMON_STOCK_ALIASES: Record<string, string> = {
+  茅台: '600519',
+  飞天茅台: '600519',
+  神华: '601088',
+  长电: '600900',
+  招行: '600036',
+  工行: '601398',
+  宇宙行: '601398',
+  建行: '601939',
+  农行: '601288',
+  中行: '601988',
+  交行: '601328',
+  兴业: '601166',
+  海油: '600938',
+  中海油: '600938',
+  中石油: '601857',
+  中石化: '600028',
+  陕煤: '601225',
+  格力: '000651',
+  美的: '000333',
+  伊利: '600887',
+  海螺: '600585',
+  宁沪: '600377',
+  粤高速: '000429',
+  宝钢: '600019',
+  宁王: '300750',
+  宁德: '300750',
+  迪王: '002594',
+  平安: '601318',
+  五粮: '000858',
+  中信: '600030',
+  恒瑞: '600276',
+  紫金: '601899',
+  万华: '600309',
+  海康: '002415',
+  药明: '603259',
+  东财: '300059',
+  迈瑞: '300760',
+  中芯: '688981',
+  寒王: '688256',
+  移动: '600941',
+  电信: '601728',
+  联通: '600050',
+  海控: '601919',
+  汾酒: '600809',
+  老窖: '000568',
+  中免: '601888',
+  讯飞: '002230',
+  阳光: '300274',
+  隆基: '601012',
+  牧原: '002714',
+  片仔癀: '600436',
+  白药: '000538',
+  太保: '601601',
+  人寿: '601628',
+};
+
+const NON_STOCK_CHATTER = new Set([
+  '你好',
+  '您好',
+  '在吗',
+  '谢谢',
+  '感谢',
+  '再见',
+  '帮助',
+  '菜单',
+  '客服',
+  '人工',
+  '测试',
+  'hello',
+  'hi',
+  'hey',
+  'ok',
+  'yes',
+  'no',
+  'help',
+  'menu',
+  'test',
+  'login',
+  'start',
+]);
+
+export function stripStockQueryNoise(raw: string): string {
+  let text = raw
+    .trim()
+    .replace(/[？?！!。，,、~～·:："'“”‘’()（）【】[\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!text) return '';
+
+  const prefixes = [
+    '请帮我查一下',
+    '请帮我看一下',
+    '帮我查一下',
+    '帮我看一下',
+    '帮我分析一下',
+    '帮我诊断一下',
+    '请帮我',
+    '帮我',
+    '请问',
+    '麻烦',
+    '我想知道',
+    '我想看',
+    '查一下',
+    '看一下',
+    '分析一下',
+    '诊断一下',
+    '看下',
+    '查查',
+    '看看',
+    '查询',
+    '分析',
+    '诊断',
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const p of prefixes) {
+      if (text.toLowerCase().startsWith(p.toLowerCase()) && text.length > p.length + 1) {
+        text = text.slice(p.length).trim();
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  const suffixes = [
+    '组合量化诊断看板',
+    '量化诊断图',
+    '趋势与量比诊断图',
+    '走势图',
+    'k线图',
+    'K线图',
+    '诊断图',
+    '怎么样',
+    '怎么看',
+    '现在能买吗',
+    '可以买吗',
+    '值得买吗',
+    '能买吗',
+    '能买么',
+    '好不好',
+    '行不行',
+    '好吗',
+    '行吗',
+    '目标价',
+    '买点',
+    '走势',
+    'k线',
+    'K线',
+    '诊断',
+    '分析',
+    '行情',
+    '股价',
+    '股票',
+    '如何',
+    '咋样',
+    '查询',
+    '查一下',
+    '吗',
+    '呢',
+    '吧',
+    '啊',
+  ];
+
+  changed = true;
+  while (changed) {
+    changed = false;
+    for (const s of suffixes) {
+      if (text.toLowerCase().endsWith(s.toLowerCase()) && text.length > s.length + 1) {
+        text = text.slice(0, text.length - s.length).trim();
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  // Collapse internal whitespace for clean Chinese/code/pinyin matching
+  return text.replace(/\s+/g, '').trim();
+}
 
 function isExcludedSecurityName(name: string): boolean {
   return /ETF|LOF|指数|转债|国债|债券|基金|REITs/i.test(name);
@@ -129,16 +313,19 @@ function inferSectorFallback(board: string): string {
   return 'A股核心标的';
 }
 
-async function resolveTargetStock(rawQuery: string): Promise<{
+export async function tryResolveWechatStockQuery(rawQuery: string): Promise<{
   code: string;
   market: MarketExchange;
   name?: string;
   sector?: string;
-}> {
-  const q = rawQuery.trim();
-  const cleanCodeMatch = q.match(/\b(\d{6})\b/);
-  if (cleanCodeMatch) {
-    const code = cleanCodeMatch[1];
+} | null> {
+  const trimmed = rawQuery.trim();
+  if (!trimmed) return null;
+
+  // 1. Direct 6-digit A-share code extraction (e.g. "601088", "sh601088", "601088走势图")
+  const codeMatch = trimmed.match(/(?:^|[^0-9])(\d{6})(?:[^0-9]|$)/);
+  if (codeMatch) {
+    const code = codeMatch[1];
     const boardInfo = inferBoardAndExchange(code);
     if (boardInfo) {
       const dict = DICTIONARY_BY_CODE.get(code);
@@ -149,6 +336,90 @@ async function resolveTargetStock(rawQuery: string): Promise<{
         sector: dict?.sector,
       };
     }
+  }
+
+  // 2. Strip natural language noise ("中国神华走势图怎么样" -> "中国神华")
+  const cleaned = stripStockQueryNoise(trimmed);
+  if (!cleaned) return null;
+
+  const cleanedLower = cleaned.toLowerCase();
+  if (NON_STOCK_CHATTER.has(cleanedLower)) {
+    return null;
+  }
+
+  // 3. Common alias direct map ("茅台" -> 600519, "宁王" -> 300750)
+  const aliasCode = COMMON_STOCK_ALIASES[cleaned] ?? COMMON_STOCK_ALIASES[trimmed];
+  if (aliasCode) {
+    const boardInfo = inferBoardAndExchange(aliasCode);
+    if (boardInfo) {
+      const dict = DICTIONARY_BY_CODE.get(aliasCode);
+      return {
+        code: aliasCode,
+        market: boardInfo.market,
+        name: dict?.name,
+        sector: dict?.sector,
+      };
+    }
+  }
+
+  // Guard against ultra-short ambiguous chatter
+  const isAsciiOnly = /^[a-z0-9]+$/i.test(cleaned);
+  if (isAsciiOnly) {
+    if (cleaned.length < 2) return null;
+    if (cleaned.length === 2) {
+      const exactLocal = LOCAL_STOCK_DICTIONARY.find((s) => s.pinyin.toLowerCase() === cleanedLower);
+      if (exactLocal) {
+        const boardInfo = inferBoardAndExchange(exactLocal.code);
+        if (boardInfo) {
+          return {
+            code: exactLocal.code,
+            market: boardInfo.market,
+            name: exactLocal.name,
+            sector: exactLocal.sector,
+          };
+        }
+      }
+      return null;
+    }
+  } else if (cleaned.length < 2) {
+    return null;
+  }
+
+  // 4. Local dictionary + Tencent Smartbox live A-share search
+  const candidates = await searchAShareStocks(cleaned);
+  if (candidates.length === 0) return null;
+
+  const exactMatch = candidates.find(
+    (c) =>
+      c.name.toLowerCase() === cleanedLower ||
+      c.pinyin.toLowerCase() === cleanedLower ||
+      c.code === cleaned,
+  );
+  const top = exactMatch ?? candidates[0];
+
+  // For ASCII pinyin searches not in local dictionary, ensure pinyin actually starts with or matches cleanedLower
+  if (isAsciiOnly && !exactMatch && !top.pinyin.toLowerCase().startsWith(cleanedLower)) {
+    return null;
+  }
+
+  return {
+    code: top.code,
+    market: top.market,
+    name: top.name,
+    sector: top.sector,
+  };
+}
+
+export async function resolveTargetStock(rawQuery: string): Promise<{
+  code: string;
+  market: MarketExchange;
+  name?: string;
+  sector?: string;
+}> {
+  const q = rawQuery.trim();
+  const resolved = await tryResolveWechatStockQuery(q);
+  if (resolved) {
+    return resolved;
   }
 
   const candidates = await searchAShareStocks(q);
@@ -409,3 +680,96 @@ export async function getQuantDiagnosis(rawQuery: string): Promise<QuantDiagnosi
 
   return response;
 }
+
+export interface HighDividendPoolSnapshotItem {
+  code: string;
+  name: string;
+  price: number;
+  changePercent: number;
+  currentYield: number;
+  targetYield: number;
+  targetBuyPrice: number;
+  dropNeededPercent: number;
+  isTargetReached: boolean;
+}
+
+let dividendSnapshotCache: { items: HighDividendPoolSnapshotItem[]; expiresAt: number } | null = null;
+
+export async function getHighDividendPoolSnapshot(): Promise<HighDividendPoolSnapshotItem[]> {
+  if (dividendSnapshotCache && dividendSnapshotCache.expiresAt > Date.now()) {
+    return dividendSnapshotCache.items;
+  }
+
+  const symbols = HIGH_DIVIDEND_POOL.map((entry) => {
+    const info = inferBoardAndExchange(entry.code);
+    return `${info?.market ?? 'sh'}${entry.code}`;
+  });
+
+  const priceMap = new Map<string, { price: number; changePercent: number }>();
+  try {
+    const url = `https://qt.gtimg.cn/q=${symbols.join(',')}`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(2200) });
+    if (resp.ok) {
+      const buffer = await resp.arrayBuffer();
+      const decoded = new TextDecoder('gbk').decode(buffer);
+      for (const line of decoded.split(';')) {
+        const match = line.match(/="([^"]+)"/);
+        if (!match || !match[1]) continue;
+        const f = match[1].split('~');
+        if (f.length < 34) continue;
+        const code = (f[2] || '').trim();
+        const price = parseFloat(f[3]) || 0;
+        const changePercent = parseFloat(f[32]) || 0;
+        if (code && price > 0) {
+          priceMap.set(code, { price, changePercent });
+        }
+      }
+    }
+  } catch {
+    // Graceful fallback using cached diagnosis entries if available
+  }
+
+  const items: HighDividendPoolSnapshotItem[] = [];
+  for (const entry of HIGH_DIVIDEND_POOL) {
+    const live = priceMap.get(entry.code) ?? (() => {
+      const cached = diagnosisCache.get(entry.code);
+      if (cached) {
+        return {
+          price: cached.data.quote.price,
+          changePercent: cached.data.quote.changePercent,
+        };
+      }
+      return null;
+    })();
+
+    if (!live || live.price <= 0) continue;
+    const info = computeHighDividendInfo(entry.code, live.price);
+    if (!info) continue;
+    items.push({
+      code: entry.code,
+      name: entry.name,
+      price: live.price,
+      changePercent: live.changePercent,
+      currentYield: info.currentYield,
+      targetYield: info.targetYield,
+      targetBuyPrice: info.targetBuyPrice,
+      dropNeededPercent: info.dropNeededPercent,
+      isTargetReached: info.isTargetReached,
+    });
+  }
+
+  items.sort((a, b) => {
+    if (a.isTargetReached !== b.isTargetReached) return a.isTargetReached ? -1 : 1;
+    return a.dropNeededPercent - b.dropNeededPercent;
+  });
+
+  if (items.length > 0) {
+    dividendSnapshotCache = {
+      items,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+    };
+  }
+
+  return items;
+}
+

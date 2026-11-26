@@ -3,7 +3,17 @@ import express from 'express';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { GoogleGenAI, Type } from '@google/genai';
-import { getQuantDiagnosis, searchAShareStocks } from './src/server/marketDataService.ts';
+import {
+  getQuantDiagnosis,
+  resolveTargetStock,
+  searchAShareStocks,
+} from './src/server/marketDataService.ts';
+import {
+  checkAndConsumeGuestQuota,
+  DEFAULT_SHOWCASE_CODE,
+  getGuestQuotaStatus,
+  sanitizeGuestKey,
+} from './src/server/guestQuotaService.ts';
 import { HIGH_DIVIDEND_POOL, inferBoardAndExchange } from './src/server/stockDictionary.ts';
 import { renderWechatStockChartPng } from './src/server/wechatChartPng.ts';
 import {
@@ -26,6 +36,7 @@ import type { WechatMpConfigUpdatePayload } from './src/shared/wechatTypes.ts';
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 const SESSION_COOKIE_NAME = 'wx_quant_session';
+const GUEST_COOKIE_NAME = 'wx_quant_guest_id';
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   if (!cookieHeader) return {};
@@ -80,6 +91,30 @@ function clearSessionCookie(res: express.Response): void {
   res.setHeader('Set-Cookie', cookieAttrs.join('; '));
 }
 
+function extractGuestIds(req: express.Request): {
+  cookieId: string | null;
+  clientId: string | null;
+} {
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieId = sanitizeGuestKey(cookies[GUEST_COOKIE_NAME]);
+  const rawHeader = req.headers['x-guest-client-id'];
+  const clientId = sanitizeGuestKey(typeof rawHeader === 'string' ? rawHeader : undefined);
+  return { cookieId, clientId };
+}
+
+function setGuestQuotaCookie(res: express.Response, guestId: string): void {
+  const cookieAttrs = [
+    `${GUEST_COOKIE_NAME}=${encodeURIComponent(guestId)}`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=315360000', // 10 years, never resets by date
+    'SameSite=None',
+    'Secure',
+    'Partitioned',
+  ];
+  res.append('Set-Cookie', cookieAttrs.join('; '));
+}
+
 function checkAdminAccess(req: express.Request): boolean {
   const configuredPasscode = (process.env.ADMIN_PASSCODE || '').trim();
   if (!configuredPasscode) {
@@ -92,6 +127,36 @@ function checkAdminAccess(req: express.Request): boolean {
   const bufB = Buffer.from(provided, 'utf8');
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function resolveRequestBaseUrl(req: express.Request): string {
+  const rawForwardedHost = req.headers['x-forwarded-host'];
+  const hostHeader = Array.isArray(rawForwardedHost)
+    ? rawForwardedHost[0]
+    : typeof rawForwardedHost === 'string'
+      ? rawForwardedHost.split(',')[0].trim()
+      : (req.headers.host || '').trim();
+
+  const rawProto = req.headers['x-forwarded-proto'];
+  const protoCandidate = (
+    Array.isArray(rawProto)
+      ? rawProto[0]
+      : typeof rawProto === 'string'
+        ? rawProto.split(',')[0].trim()
+        : req.protocol || 'http'
+  ).toLowerCase();
+
+  const proto = protoCandidate === 'https' || protoCandidate === 'http' ? protoCandidate : 'https';
+
+  // Strictly validate hostname[:port] to guard against header injection
+  if (hostHeader && /^[a-zA-Z0-9.-]+(?::\d{1,5})?$/.test(hostHeader)) {
+    const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(hostHeader);
+    const effectiveProto = !isLocal && protoCandidate === 'https' ? 'https' : proto;
+    return `${effectiveProto}://${hostHeader}`;
+  }
+
+  const fallback = (process.env.SITE_URL || process.env.APP_URL || `http://localhost:${PORT}`).trim();
+  return fallback.replace(/\/+$/, '');
 }
 
 async function startServer() {
@@ -117,13 +182,18 @@ async function startServer() {
     async (req, res) => {
       try {
         const rawBody = typeof req.body === 'string' ? req.body : '';
-        const result = await handleWechatWebhookPost(rawBody, {
-          signature: typeof req.query.signature === 'string' ? req.query.signature : undefined,
-          msg_signature: typeof req.query.msg_signature === 'string' ? req.query.msg_signature : undefined,
-          timestamp: typeof req.query.timestamp === 'string' ? req.query.timestamp : undefined,
-          nonce: typeof req.query.nonce === 'string' ? req.query.nonce : undefined,
-          encrypt_type: typeof req.query.encrypt_type === 'string' ? req.query.encrypt_type : undefined,
-        });
+        const baseUrl = resolveRequestBaseUrl(req);
+        const result = await handleWechatWebhookPost(
+          rawBody,
+          {
+            signature: typeof req.query.signature === 'string' ? req.query.signature : undefined,
+            msg_signature: typeof req.query.msg_signature === 'string' ? req.query.msg_signature : undefined,
+            timestamp: typeof req.query.timestamp === 'string' ? req.query.timestamp : undefined,
+            nonce: typeof req.query.nonce === 'string' ? req.query.nonce : undefined,
+            encrypt_type: typeof req.query.encrypt_type === 'string' ? req.query.encrypt_type : undefined,
+          },
+          baseUrl,
+        );
         res.status(result.statusCode).type(result.contentType).send(result.body);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Webhook 处理异常';
@@ -275,6 +345,19 @@ async function startServer() {
     res.json({ items });
   });
 
+  // 2b. Permanent lifetime guest query quota (3 stocks total when not followed/logged in; never resets on date change)
+  app.get('/api/guest-quota', (req, res) => {
+    const token = extractSessionToken(req);
+    const session = getSessionByToken(token);
+    const isLoggedIn = Boolean(session?.isLoggedIn);
+    const guestIds = extractGuestIds(req);
+    const { guestId, quota } = getGuestQuotaStatus(guestIds, isLoggedIn);
+    if (!guestIds.cookieId || guestIds.cookieId !== guestId) {
+      setGuestQuotaCookie(res, guestId);
+    }
+    res.json(quota);
+  });
+
   // 3. Full-market real-time quote & pure-algorithm 7-dim quant diagnosis
   app.get('/api/stock/quant-diagnosis', async (req, res) => {
     try {
@@ -283,15 +366,48 @@ async function startServer() {
         res.status(400).json({ error: '请提供股票代码、简称或拼音首字母参数 q' });
         return;
       }
-      const diagnosis = await getQuantDiagnosis(q);
-      res.json(diagnosis);
+
+      const token = extractSessionToken(req);
+      const session = getSessionByToken(token);
+      const isLoggedIn = Boolean(session?.isLoggedIn);
+      const isInitialShowcasePreview = req.query.preview === '1';
+
+      const target = await resolveTargetStock(q);
+      const guestIds = extractGuestIds(req);
+
+      // Default homepage showcase stock (601088) preview on boot does not burn guest quota,
+      // while all explicit stock queries are strictly capped at 3 distinct stocks permanently.
+      if (!isLoggedIn && !(isInitialShowcasePreview && target.code === DEFAULT_SHOWCASE_CODE)) {
+        const check = checkAndConsumeGuestQuota(guestIds, target.code, false);
+        if (!guestIds.cookieId || guestIds.cookieId !== check.guestId) {
+          setGuestQuotaCookie(res, check.guestId);
+        }
+        if (!check.allowed) {
+          res.status(403).json({
+            error: '未关注公众号最多仅可查询 3 个个股（永久累计，不随日期更新而重置），关注微信公众号登录后即可解锁无限查询。',
+            code: 'GUEST_QUOTA_EXCEEDED',
+            quota: check.quota,
+          });
+          return;
+        }
+        const diagnosis = await getQuantDiagnosis(target.code);
+        res.json({ ...diagnosis, guestQuota: check.quota });
+        return;
+      }
+
+      const { guestId, quota } = getGuestQuotaStatus(guestIds, isLoggedIn);
+      if (!guestIds.cookieId || guestIds.cookieId !== guestId) {
+        setGuestQuotaCookie(res, guestId);
+      }
+      const diagnosis = await getQuantDiagnosis(target.code);
+      res.json({ ...diagnosis, guestQuota: quota });
     } catch (err) {
       const message = err instanceof Error ? err.message : '量化直算引擎异常';
       res.status(404).json({ error: message });
     }
   });
 
-  // 4. WeChat auto-reply identical 1120px combo quant diagnosis PNG
+  // 4. WeChat auto-reply 2x Retina 2240px combo quant diagnosis PNG (default full/long view)
   app.get('/api/wechat/stock-chart/:fileParam', async (req, res) => {
     try {
       const rawParam = req.params.fileParam || '';
@@ -313,7 +429,7 @@ async function startServer() {
 
       res.setHeader('Content-Type', 'image/png');
       res.setHeader('Content-Disposition', `inline; filename="quant-${code}-${periodMode}.png"`);
-      res.setHeader('Cache-Control', 'public, max-age=15');
+      res.setHeader('Cache-Control', 'public, max-age=60');
       res.send(pngBuffer);
     } catch (err) {
       const message = err instanceof Error ? err.message : '生成组合看板图片失败';

@@ -123,3 +123,13 @@ export interface WechatImageUploadTestResponse {
   hint: string;
   durationMs: number;
 }
+
+export interface GuestQuotaInfo {
+  limit: number;
+  used: number;
+  remaining: number;
+  queriedCodes: string[];
+  isUnlimited: boolean;
+  neverResets: true;
+}
+

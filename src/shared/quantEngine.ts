@@ -167,6 +167,35 @@ export function analyzeKdj(kSeries: number[], dSeries: number[], jSeries: number
   };
 }
 
+export function formatWechatTrendConclusion(direction: TrendDirection): string {
+  switch (direction) {
+    case 'bullish':
+      return '多头趋势';
+    case 'leaning_bull':
+      return '偏多趋势';
+    case 'bearish':
+      return '空头趋势';
+    case 'leaning_bear':
+      return '偏空趋势';
+    case 'neutral':
+    default:
+      return '震荡整理';
+  }
+}
+
+export function formatWechatVolumeStateLabel(volumeRatio: number): string {
+  if (volumeRatio > 3.0) {
+    return '显著放量异动(>3.0)';
+  }
+  if (volumeRatio >= 1.5) {
+    return '温和放量';
+  }
+  if (volumeRatio >= 0.8) {
+    return '量能平稳正常';
+  }
+  return '缩量观望(<0.8)';
+}
+
 export function analyzeVolumeState(
   volumeRatio: number,
   changePercent: number,

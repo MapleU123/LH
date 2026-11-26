@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  formatWechatTrendConclusion,
+  formatWechatVolumeStateLabel,
+} from '../shared/quantEngine.ts';
+import type { QuantDiagnosisResponse } from '../shared/quantTypes.ts';
 import type {
   UserSession,
   VisitorTrailLog,
@@ -13,8 +18,12 @@ import type {
   WechatSignatureTestResult,
   WebhookHitLog,
 } from '../shared/wechatTypes.ts';
-import { getQuantDiagnosis } from './marketDataService.ts';
-import { inferBoardAndExchange } from './stockDictionary.ts';
+import {
+  getHighDividendPoolSnapshot,
+  getQuantDiagnosis,
+  tryResolveWechatStockQuery,
+} from './marketDataService.ts';
+import { HIGH_DIVIDEND_POOL, inferBoardAndExchange } from './stockDictionary.ts';
 import { renderWechatStockChartPng } from './wechatChartPng.ts';
 
 const PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -122,10 +131,10 @@ export function getEffectiveMpConfig(): EffectiveMpConfig {
     appSecret: (saved.appSecret || process.env.WECHAT_MP_APP_SECRET || '').trim(),
     token: (saved.token || process.env.WECHAT_MP_TOKEN || '').trim(),
     aesKey: (saved.aesKey || process.env.WECHAT_MP_AES_KEY || '').trim(),
-    originalId: (saved.originalId || process.env.WECHAT_MP_ORIGINAL_ID || 'gh_7d39de02f610').trim(),
+    originalId: (saved.originalId || process.env.WECHAT_MP_ORIGINAL_ID || 'gh_dec752a19703').trim(),
     mpName: (saved.mpName || process.env.WECHAT_MP_NAME || '我爱这young').trim(),
-    wechatId: (saved.wechatId || process.env.WECHAT_MP_WECHAT_ID || 'gh_7d39de02f610').trim(),
-    qrUrl: (saved.qrUrl || process.env.WECHAT_MP_QR_URL || '/assets/aistudio/qrcode_gh_7d39de02f610_ff29ce68.jpg').trim(),
+    wechatId: (saved.wechatId || process.env.WECHAT_MP_WECHAT_ID || 'gh_dec752a19703').trim(),
+    qrUrl: (saved.qrUrl || process.env.WECHAT_MP_QR_URL || '/assets/aistudio/image_77d5f18c.png').trim(),
     alertTemplateId: (saved.alertTemplateId || process.env.WECHAT_MP_ALERT_TEMPLATE_ID || '').trim(),
     subTemplateStockId: (saved.subTemplateStockId || process.env.WECHAT_MP_SUB_TEMPLATE_STOCK_ID || '').trim(),
     updatedAt: saved.updatedAt ?? null,
@@ -520,6 +529,22 @@ function buildEncryptedReplyXml(
 </xml>`;
 }
 
+export function buildWeChatReplyXml(params: {
+  toUser: string;
+  fromUser: string;
+  content: string;
+  isEncrypted: boolean;
+  token?: string;
+  aesKey?: string;
+  appId?: string;
+}): string {
+  const plainXml = buildTextReplyXml(params.toUser, params.fromUser, params.content);
+  if (params.isEncrypted && params.token && params.aesKey) {
+    return buildEncryptedReplyXml(plainXml, params.token, params.aesKey, params.appId || '');
+  }
+  return plainXml;
+}
+
 // ============================================================================
 // WeChat Access Token, User Info (450ms Timeout), & Diagnostic Tools
 // ============================================================================
@@ -735,6 +760,93 @@ export function handleWechatWebhookGet(query: {
   return { statusCode: 200, body: echostr };
 }
 
+function normalizeBaseUrl(rawBaseUrl?: string): string {
+  const candidate = (rawBaseUrl || process.env.SITE_URL || process.env.APP_URL || 'http://localhost:3000').trim();
+  return candidate.replace(/\/+$/, '');
+}
+
+export function formatStockAutoReplyText(params: {
+  nickname?: string;
+  diag: QuantDiagnosisResponse;
+  baseUrl: string;
+  timestamp?: number;
+}): string {
+  const { diag, baseUrl } = params;
+  const q = diag.quote;
+  const displayName = (params.nickname || '').trim() || '朋友';
+  const changeSign = q.changePercent >= 0 ? '+' : '';
+  const trendConclusion = formatWechatTrendConclusion(diag.expmaLong.trendDirection);
+  const volumeState = formatWechatVolumeStateLabel(diag.volume.volumeRatio);
+  const ts = params.timestamp ?? Date.now();
+  const cleanBaseUrl = normalizeBaseUrl(baseUrl);
+  const pngUrl = `${cleanBaseUrl}/api/wechat/stock-chart/${q.code}.png?t=${ts}`;
+
+  const paragraphs: string[] = [
+    `${displayName}，已为您生成【${q.name}(${q.code})】趋势与量比诊断图`,
+    `· 实时现价：¥${q.price.toFixed(2)}（${changeSign}${q.changePercent.toFixed(2)}%）`,
+    `· 趋势判定：${trendConclusion}`,
+    `· 成交量比：量比 ${diag.volume.volumeRatio.toFixed(2)}（${volumeState}）`,
+    `· 量价结论：${diag.volume.volumeSynergyLabel}`,
+  ];
+
+  if (diag.dividendInfo && diag.dividendInfo.inPool) {
+    const d = diag.dividendInfo;
+    const targetState = d.isTargetReached
+      ? '✅ 已达标'
+      : `📉 需跌 ${d.dropNeededPercent.toFixed(2)}%`;
+    paragraphs.push(
+      `· 高股息目标：现股息 ${d.currentYield.toFixed(2)}% → 目标买价 ¥${d.targetBuyPrice.toFixed(2)}（${targetState}）`,
+    );
+  }
+
+  paragraphs.push(`🖼️ 点击查看组合量化诊断看板（PNG）：\n${pngUrl}`);
+  return paragraphs.join('\n\n');
+}
+
+async function buildHighDividendStatusReply(baseUrl: string): Promise<string> {
+  const snapshot = await getHighDividendPoolSnapshot();
+  if (snapshot.length === 0) {
+    const fallbackList = HIGH_DIVIDEND_POOL.slice(0, 6)
+      .map((item) => `· ${item.name}(${item.code}) 目标股息 ${item.targetDividendYield.toFixed(1)}%`)
+      .join('\n');
+    return `高股息核心池观察标的：\n\n${fallbackList}\n\n直接发送股票名称或 6 位代码（如：中国神华、601088），即可获取实时趋势与量比诊断看板！\n\n🌐 网页端：${normalizeBaseUrl(baseUrl)}`;
+  }
+
+  const reached = snapshot.filter((s) => s.isTargetReached);
+  const nearTarget = snapshot.filter((s) => !s.isTargetReached).slice(0, 5);
+
+  const lines: string[] = ['高股息目标买价实时监测'];
+  if (reached.length > 0) {
+    lines.push(
+      `✅ 已达目标买价（${reached.length} 只）：\n` +
+        reached
+          .slice(0, 5)
+          .map(
+            (s) =>
+              `· ${s.name}(${s.code}) 现价 ¥${s.price.toFixed(2)} / 目标 ¥${s.targetBuyPrice.toFixed(2)}（股息 ${s.currentYield.toFixed(2)}%）`,
+          )
+          .join('\n'),
+    );
+  } else {
+    lines.push('⏳ 当前暂无标的跌入理想目标买价区，以下为距离买点最近的观察标的：');
+  }
+
+  if (nearTarget.length > 0) {
+    lines.push(
+      `📌 临近目标买价：\n` +
+        nearTarget
+          .map(
+            (s) =>
+              `· ${s.name}(${s.code}) 现价 ¥${s.price.toFixed(2)} → 目标 ¥${s.targetBuyPrice.toFixed(2)}（需跌 ${s.dropNeededPercent.toFixed(2)}%）`,
+          )
+          .join('\n'),
+    );
+  }
+
+  lines.push('💡 直接回复个股名称或代码（如：中国神华、601088），即可生成 2 倍超清组合量化诊断看板 PNG。');
+  return lines.join('\n\n');
+}
+
 export async function handleWechatWebhookPost(
   rawBody: string,
   query: {
@@ -744,9 +856,11 @@ export async function handleWechatWebhookPost(
     nonce?: string;
     encrypt_type?: string;
   },
+  baseUrl?: string,
 ): Promise<{ statusCode: number; contentType: string; body: string }> {
   const start = Date.now();
   const cfg = getEffectiveMpConfig();
+  const effectiveBaseUrl = normalizeBaseUrl(baseUrl);
   const timestamp = query.timestamp ?? '';
   const nonce = query.nonce ?? '';
   const signature = query.signature ?? '';
@@ -807,62 +921,156 @@ export async function handleWechatWebhookPost(
   const content = extractXmlTag(plainXml, 'Content');
   const event = extractXmlTag(plainXml, 'Event').toLowerCase();
 
+  // Start non-blocking concurrent fetch for WeChat nickname (450ms hard cap)
+  const userInfoPromise = fetchWechatUserInfoWithTimeout(fromUser, 450);
+
   let replyText = '';
   let outcome = 'handled';
 
-  if (msgType === 'text' && /^\d{6}$/.test(content)) {
-    const pendingRec = pairingSessions.get(content);
+  if (msgType === 'event') {
+    if (event === 'unsubscribe') {
+      recordWebhookHit({
+        method: 'POST',
+        durationMs: Date.now() - start,
+        encrypted: isEncrypted,
+        outcome: 'unsubscribe',
+        detail: `From=${maskSecret(fromUser, 3, 3)} -> unsubscribe`,
+      });
+      return { statusCode: 200, contentType: 'text/plain', body: 'success' };
+    }
+
+    const userInfo = await userInfoPromise;
+    if (event === 'subscribe') {
+      recordVisitor(fromUser, userInfo.nickname, '关注公众号');
+      const greet = userInfo.nickname ? `${userInfo.nickname}，` : '';
+      replyText = [
+        `${greet}欢迎关注「${cfg.mpName}」！`,
+        '1. 发送任意 A 股【股票名称 / 简称 / 拼音 / 6 位代码】（如：中国神华、茅台、601088、zgsh），秒出实时趋势与量比诊断图；',
+        '2. 发送网站生成的【6 位数字配对码】即可免密登录网站；',
+        '3. 发送关键词【高股息】【达标】【买点】【网格交易】获取核心策略监测。',
+      ].join('\n\n');
+      outcome = 'subscribe';
+    } else {
+      replyText = `欢迎使用「${cfg.mpName}」量化诊断助手！直接发送 A 股名称、简称、拼音或 6 位代码即可生成趋势与量比诊断图。`;
+      outcome = `event:${event || 'unknown'}`;
+    }
+  } else if (msgType === 'text') {
+    const trimmed = content.trim();
+    const compactText = trimmed.replace(/[？?！!。，,\s]+/g, '');
+
+    // Priority 1: Pending 6-digit login pairing code
+    const pendingRec = /^\d{6}$/.test(trimmed) ? pairingSessions.get(trimmed) : undefined;
     if (pendingRec && pendingRec.status === 'pending' && Date.now() <= pendingRec.expiresAt) {
-      // Priority 1: Pending 6-digit login pairing code
-      const userInfo = await fetchWechatUserInfoWithTimeout(fromUser, 450);
-      recordVisitor(fromUser, userInfo.nickname, `配对码 ${content} 绑定成功`);
-      confirmPairing(content, {
+      const userInfo = await userInfoPromise;
+      recordVisitor(fromUser, userInfo.nickname, `配对码 ${trimmed} 绑定成功`);
+      confirmPairing(trimmed, {
         openid: fromUser,
-        nickname: userInfo.nickname || `微信用户_${content.slice(-4)}`,
+        nickname: userInfo.nickname || `微信用户_${trimmed.slice(-4)}`,
         avatar: userInfo.avatar,
       });
 
       const nickPrefix = userInfo.nickname ? `${userInfo.nickname}，` : '';
-      replyText = `🎉 恭喜${nickPrefix}配对码【${content}】验证成功！您的微信已与网站账号绑定，之后在网站登录时可直接用微信授权。`;
-      outcome = `paired:${content}`;
-    } else if (inferBoardAndExchange(content)) {
-      // Priority 2: Valid 6-digit A-share code query
-      try {
-        const diag = await getQuantDiagnosis(content);
-        const q = diag.quote;
-        const evalLong = diag.evaluation;
-        replyText = [
-          `📊 ${q.name}（${q.code}.${q.market.toUpperCase()}）`,
-          `现价：¥${q.price.toFixed(2)}（${q.change >= 0 ? '+' : ''}${q.changePercent.toFixed(2)}%）`,
-          `EXPMA 7/21/55/144：${evalLong.activeExpma.trendLabel}`,
-          `量比：${diag.volume.volumeRatio.toFixed(2)}（${evalLong.volumeStateLabel}）`,
-          `KDJ(9,3,3)：${diag.kdj.signalLabel}`,
-          `7维量化评分：${evalLong.compositeScore}/100`,
-          `总评：${evalLong.oneLineSummary}`,
-        ].join('\n');
-        recordVisitor(fromUser, '', `查询个股 ${q.name}(${q.code})`);
-        outcome = `stock:${q.code}`;
-      } catch {
-        replyText = `未检索到股票或配对码【${content}】，若为网站配对码请刷新页面获取最新 6 位数字。`;
-        outcome = `unknown_6digit:${content}`;
+      replyText = `🎉 恭喜${nickPrefix}配对码【${trimmed}】验证成功！您的微信已与网站账号绑定，之后在网站登录时可直接用微信授权。`;
+      outcome = `paired:${trimmed}`;
+    }
+    // Priority 2: Fixed keywords (登录 / 高股息 / 下载清单 / 网格交易 / 加群 / 入群)
+    else if (/^(登录|扫码登录|微信登录|绑定|配对)$/i.test(compactText)) {
+      replyText = [
+        '🔐 网站微信免密登录指引',
+        '1. 打开网站并点击顶部「关注微信公众号登录」，获取 6 位数字配对码；',
+        '2. 直接在本公众号回复该 6 位纯数字配对码，即可自动完成登录解锁；',
+        `🌐 访问地址：${effectiveBaseUrl}`,
+      ].join('\n\n');
+      outcome = 'keyword:login';
+    } else if (/^(高股息|分红池|高股息池|高股息清单)$/i.test(compactText)) {
+      replyText = await buildHighDividendStatusReply(effectiveBaseUrl);
+      outcome = 'keyword:high_dividend';
+    } else if (/^(下载清单|清单下载|导出清单|导出)$/i.test(compactText)) {
+      replyText = [
+        '📥 高股息清单与量化看板导出',
+        `请访问网页端【高股息观察池】或【个股速查】，即可一键导出组合量化诊断看板 PNG 长图与高股息清单：\n${effectiveBaseUrl}`,
+        '💡 您也可以直接在这里回复任意个股名称或代码（如：中国神华、601088），立即生成超清看板链接。',
+      ].join('\n\n');
+      outcome = 'keyword:download_list';
+    } else if (/^(网格交易|网格|网格策略)$/i.test(compactText)) {
+      replyText = [
+        '📐 稳健网格交易执行要点',
+        '1. 标的选择：优先高股息、低估值、现金流稳健的蓝筹标的（如长江电力、中国神华、招商银行）；',
+        '2. 建仓锚点：结合 EXPMA(7/21/55/144) 多空趋势与 KDJ 低位信号分批布网；',
+        '3. 发送任意股票名称或代码，可即时查看现价相对均线偏离度与高股息目标买价。',
+      ].join('\n\n');
+      outcome = 'keyword:grid';
+    } else if (/^(加群|入群|进群|交流群|社群)$/i.test(compactText)) {
+      replyText = [
+        `👋 欢迎加入「${cfg.mpName}」量化交流圈`,
+        '直接发送 A 股名称、简称、拼音首字母或 6 位代码（如：中国神华、茅台、zgsh、601088），即可随时调用实时量化诊断看板。',
+        `🌐 网页端完整看板：${effectiveBaseUrl}`,
+      ].join('\n\n');
+      outcome = 'keyword:group';
+    }
+    // Priority 3: High-dividend query triggers (达标 / 买点 / 目标价)
+    else if (
+      trimmed.includes('达标') ||
+      trimmed.includes('买点') ||
+      trimmed.includes('目标价')
+    ) {
+      replyText = await buildHighDividendStatusReply(effectiveBaseUrl);
+      outcome = 'trigger:dividend_target';
+    }
+    // Priority 4: A-share stock identification (6-digit code, full name, alias, short name, pinyin, noise-stripped text)
+    else if (trimmed.length > 0) {
+      if (/^\d{6}$/.test(trimmed) && !inferBoardAndExchange(trimmed)) {
+        replyText = `未识别到有效的 A 股代码或有效配对码【${trimmed}】。如需登录请刷新网站配对码，如需诊股请发送 60/68/00/30/8/4/92 开头的 A 股代码或股票简称。`;
+        outcome = `invalid_6digit:${trimmed}`;
+      } else {
+        const resolved = await tryResolveWechatStockQuery(trimmed);
+        if (resolved) {
+          try {
+            const [diag, userInfo] = await Promise.all([
+              getQuantDiagnosis(resolved.code),
+              userInfoPromise,
+            ]);
+            replyText = formatStockAutoReplyText({
+              nickname: userInfo.nickname,
+              diag,
+              baseUrl: effectiveBaseUrl,
+            });
+            recordVisitor(
+              fromUser,
+              userInfo.nickname,
+              `查询个股 ${diag.quote.name}(${diag.quote.code})`,
+            );
+            outcome = `stock:${diag.quote.code}`;
+          } catch {
+            replyText = `暂时无法拉取【${trimmed}】实时行情，请稍后再试或发送 6 位标准 A 股代码。`;
+            outcome = `stock_fetch_failed:${resolved.code}`;
+          }
+        } else {
+          replyText = [
+            `未匹配到 A 股标的【${trimmed}】`,
+            '请发送 A 股全称/简称（如：中国神华、茅台、宁德时代）、拼音首字母（如：zgsh、gzmt）或 6 位股票代码（如：601088），也可发送网站 6 位登录配对码。',
+          ].join('\n\n');
+          outcome = `unmatched:${trimmed.slice(0, 20)}`;
+        }
       }
     } else {
-      replyText = `配对码【${content}】不存在或已过期，请在网站登录窗口刷新获取新的 6 位配对码后重试。`;
-      outcome = `expired_or_invalid_code:${content}`;
+      replyText = '请发送 A 股名称、简称、拼音或 6 位代码获取趋势与量比诊断图，或发送网站 6 位配对码完成登录。';
+      outcome = 'empty_text';
     }
-  } else if (msgType === 'event' && event === 'subscribe') {
-    recordVisitor(fromUser, '', '关注公众号');
-    replyText = `欢迎关注「${cfg.mpName}」！\n1. 发送网站生成的【6位数字配对码】即可免密登录网站；\n2. 发送【6位A股代码】（如 601088）获取双周期 EXPMA 与 7 维量化诊断。`;
-    outcome = 'subscribe';
   } else {
-    replyText = `请发送网站上的【6位数字配对码】完成免密登录解锁，或发送【6位A股代码】（如 601088）获取实时量化诊断。`;
-    outcome = `text:${msgType || 'unknown'}`;
+    replyText = '请发送文字消息：输入任意 A 股名称/简称/拼音/6位代码即可生成趋势与量比诊断图，或输入网站 6 位配对码登录。';
+    outcome = `non_text:${msgType || 'unknown'}`;
   }
 
-  let responseXml = buildTextReplyXml(fromUser, toUser, replyText);
-  if (isEncrypted && cfg.token && cfg.aesKey) {
-    responseXml = buildEncryptedReplyXml(responseXml, cfg.token, cfg.aesKey, cfg.appId);
-  }
+  const responseXml = buildWeChatReplyXml({
+    toUser: fromUser,
+    fromUser: toUser,
+    content: replyText,
+    isEncrypted,
+    token: cfg.token,
+    aesKey: cfg.aesKey,
+    appId: cfg.appId,
+  });
 
   recordWebhookHit({
     method: 'POST',

@@ -6,6 +6,8 @@ import {
   Image as ImageIcon,
   LineChart as LineChartIcon,
   Loader2,
+  Lock,
+  QrCode,
   RotateCcw,
   Search,
   X,
@@ -18,6 +20,12 @@ import type {
   QuantRuleThresholds,
   StockSearchItem,
 } from '../shared/quantTypes.ts';
+import type { GuestQuotaInfo } from '../shared/wechatTypes.ts';
+import {
+  getOrCreateGuestClientId,
+  loadLocalGuestQuota,
+  mergeAndSaveGuestQuota,
+} from '../utils/guestQuotaClient.ts';
 import { AiDeepDiagnosisCard } from './AiDeepDiagnosisCard.tsx';
 import { Diagnosis7DimGrid } from './Diagnosis7DimGrid.tsx';
 import { QuantChartsPanel } from './QuantChartsPanel.tsx';
@@ -60,16 +68,24 @@ function loadRecentStocks(): RecentStockItem[] {
 interface StockQuickLookupProps {
   mode: 'embedded' | 'modal';
   initialQuery?: string;
+  initialIsPreview?: boolean;
+  queryNonce?: number;
   onCloseModal?: () => void;
   isLoggedIn?: boolean;
+  guestQuota?: GuestQuotaInfo;
+  onGuestQuotaChange?: (quota: GuestQuotaInfo) => void;
   onRequireAuth?: (reason: string) => void;
 }
 
 export function StockQuickLookup({
   mode,
   initialQuery = '601088',
+  initialIsPreview = false,
+  queryNonce = 0,
   onCloseModal,
   isLoggedIn = true,
+  guestQuota,
+  onGuestQuotaChange,
   onRequireAuth,
 }: StockQuickLookupProps) {
   const [searchInput, setSearchInput] = useState(initialQuery);
@@ -86,6 +102,8 @@ export function StockQuickLookup({
   const [diagnosisData, setDiagnosisData] = useState<QuantDiagnosisResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [quotaBlockedMessage, setQuotaBlockedMessage] = useState<string | null>(null);
+  const [internalQuota, setInternalQuota] = useState<GuestQuotaInfo>(() => loadLocalGuestQuota(isLoggedIn));
 
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -94,6 +112,23 @@ export function StockQuickLookup({
   const searchBoxRef = useRef<HTMLDivElement>(null);
   const lastFetchedQueryRef = useRef<string>('');
   const suppressAutoRef = useRef(false);
+
+  const activeQuota = guestQuota ?? internalQuota;
+
+  const updateQuotaState = useCallback(
+    (incoming: GuestQuotaInfo | null | undefined) => {
+      const merged = mergeAndSaveGuestQuota(incoming, isLoggedIn);
+      setInternalQuota(merged);
+      onGuestQuotaChange?.(merged);
+    },
+    [isLoggedIn, onGuestQuotaChange],
+  );
+
+  useEffect(() => {
+    if (isLoggedIn) {
+      setQuotaBlockedMessage(null);
+    }
+  }, [isLoggedIn]);
 
   const saveRecentStock = useCallback((code: string, name: string) => {
     setRecentStocks((prev) => {
@@ -108,21 +143,52 @@ export function StockQuickLookup({
   }, []);
 
   const runDiagnosis = useCallback(
-    async (queryText: string) => {
+    async (queryText: string, options?: { isPreview?: boolean; silentAuthPrompt?: boolean }) => {
       const q = queryText.trim();
       if (!q) return;
       lastFetchedQueryRef.current = q;
       setDropdownOpen(false);
       setLoading(true);
       setError(null);
+      setQuotaBlockedMessage(null);
       setAiResult(null);
       setAiError(null);
 
       try {
-        const res = await fetch(`/api/stock/quant-diagnosis?q=${encodeURIComponent(q)}`);
-        const json = (await res.json()) as QuantDiagnosisResponse & { error?: string };
+        const previewParam = options?.isPreview && q === '601088' ? '&preview=1' : '';
+        const res = await fetch(`/api/stock/quant-diagnosis?q=${encodeURIComponent(q)}${previewParam}`, {
+          credentials: 'include',
+          headers: {
+            'x-guest-client-id': getOrCreateGuestClientId(),
+          },
+        });
+        const json = (await res.json()) as QuantDiagnosisResponse & {
+          error?: string;
+          code?: string;
+          quota?: GuestQuotaInfo;
+          guestQuota?: GuestQuotaInfo;
+        };
+
+        if (res.status === 403 && json.code === 'GUEST_QUOTA_EXCEEDED') {
+          if (json.quota) {
+            updateQuotaState(json.quota);
+          }
+          const msg =
+            json.error ||
+            '未关注公众号最多仅可查询 3 个个股（永久累计，不因日期更新而重置），关注微信公众号登录后即可解锁无限查询。';
+          setQuotaBlockedMessage(msg);
+          if (!options?.silentAuthPrompt) {
+            onRequireAuth?.(msg);
+          }
+          return;
+        }
+
         if (!res.ok) {
           throw new Error(json.error || '查询个股量化数据失败');
+        }
+
+        if (json.guestQuota) {
+          updateQuotaState(json.guestQuota);
         }
         setDiagnosisData(json);
         suppressAutoRef.current = true;
@@ -134,14 +200,17 @@ export function StockQuickLookup({
         setLoading(false);
       }
     },
-    [saveRecentStock],
+    [onRequireAuth, saveRecentStock, updateQuotaState],
   );
 
   useEffect(() => {
     if (initialQuery) {
-      void runDiagnosis(initialQuery);
+      void runDiagnosis(initialQuery, {
+        isPreview: initialIsPreview,
+        silentAuthPrompt: initialIsPreview,
+      });
     }
-  }, [initialQuery, runDiagnosis]);
+  }, [initialQuery, initialIsPreview, queryNonce, runDiagnosis]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -296,10 +365,34 @@ export function StockQuickLookup({
       {/* 1. Top Search & Control Bar */}
       <section className="rounded-xl border border-slate-800 bg-[#0F1521] p-5">
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <h2 className="text-lg font-bold tracking-wide text-slate-100">
               个股速查
             </h2>
+            {!isLoggedIn && (
+              <button
+                type="button"
+                onClick={() =>
+                  onRequireAuth?.(
+                    '未关注微信公众号最多仅可查询 3 个个股（永久累计，不随日期重置），关注公众号登录后即可无限查询',
+                  )
+                }
+                className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                  activeQuota.remaining === 0
+                    ? 'border-red-500/40 bg-red-500/15 text-red-300 hover:bg-red-500/25'
+                    : activeQuota.remaining === 1
+                      ? 'border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+                      : 'border-sky-500/35 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
+                }`}
+              >
+                <Lock className="h-3 w-3 shrink-0" />
+                <span>
+                  {activeQuota.remaining === 0
+                    ? `未关注免费额度已用尽 (${activeQuota.used}/${activeQuota.limit} · 永久不重置)`
+                    : `未关注免费查询：剩余 ${activeQuota.remaining}/${activeQuota.limit} 个（不按日重置）`}
+                </span>
+              </button>
+            )}
             {mode === 'modal' && onCloseModal && (
               <button
                 type="button"
@@ -460,6 +553,7 @@ export function StockQuickLookup({
           </span>
           {recentStocks.map((item) => {
             const isCurrent = quote?.code === item.code;
+            const isUnlockedForGuest = isLoggedIn || activeQuota.queriedCodes.includes(item.code);
             return (
               <button
                 key={item.code}
@@ -475,10 +569,45 @@ export function StockQuickLookup({
                 <span className={`font-mono tabular-nums ${isCurrent ? 'text-blue-100' : 'text-slate-500'}`}>
                   {item.code}
                 </span>
+                {!isLoggedIn && !isUnlockedForGuest && activeQuota.remaining === 0 && (
+                  <Lock className="h-3 w-3 text-amber-400" />
+                )}
               </button>
             );
           })}
         </div>
+
+        {/* Permanent Guest Quota Exhausted Notice */}
+        {!isLoggedIn && (quotaBlockedMessage || activeQuota.remaining === 0) && (
+          <div className="mt-3.5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs">
+            <div className="flex items-start gap-2.5 text-amber-200">
+              <Lock className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+              <div className="space-y-0.5">
+                <div className="font-semibold text-amber-100">
+                  {quotaBlockedMessage ||
+                    `未关注公众号最多仅可查询 ${activeQuota.limit} 个个股（当前已使用 ${activeQuota.used}/${activeQuota.limit} 个，永久累计不因日期更新而重设）`}
+                </div>
+                {activeQuota.queriedCodes.length > 0 && (
+                  <div className="text-[11px] text-amber-200/80">
+                    已查标的（可重复回看）：{activeQuota.queriedCodes.join('、')} · 关注微信公众号登录后立即可查全市场不限次数
+                  </div>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() =>
+                onRequireAuth?.(
+                  '未关注微信公众号最多仅可查询 3 个个股（永久累计，不随日期更新而重置）。扫码关注并回复 6 位配对码即可无限查询！',
+                )
+              }
+              className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-sky-500 whitespace-nowrap shrink-0"
+            >
+              <QrCode className="h-3.5 w-3.5" />
+              <span>关注微信公众号解锁</span>
+            </button>
+          </div>
+        )}
       </section>
 
       {/* Loading & Error States */}
